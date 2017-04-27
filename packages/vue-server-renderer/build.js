@@ -4876,13 +4876,22 @@ var has = {};
 var circular = {};
 var waiting = false;
 var flushing = false;
+var insideRun = false;
 var index$1 = 0;
+var afterFlushCallbacks = [];
 
 /**
  * Reset the scheduler's state.
  */
 function resetSchedulerState () {
+  // if we got to the end of the queue, we can just empty the queue
+  if (index$1 === queue.length) {
   queue.length = activatedChildren.length = 0;
+  // else, we only remove watchers we ran
+  } else {
+    queue.splice(0, index$1);
+    activatedChildren.splice(0, index$1);
+  }
   has = {};
   if (process.env.NODE_ENV !== 'production') {
     circular = {};
@@ -4894,57 +4903,99 @@ function resetSchedulerState () {
  * Flush both queues and run the watchers.
  */
 function flushSchedulerQueue () {
-  flushing = true;
-  var watcher, id;
-
-  // Sort queue before flush.
-  // This ensures that:
-  // 1. Components are updated from parent to child. (because parent is always
-  //    created before the child)
-  // 2. A component's user watchers are run before its render watcher (because
-  //    user watchers are created before the render watcher)
-  // 3. If a component is destroyed during a parent component's watcher run,
-  //    its watchers can be skipped.
-  queue.sort(function (a, b) { return a.id - b.id; });
-
-  // do not cache length because more watchers might be pushed
-  // as we run existing watchers
-  for (index$1 = 0; index$1 < queue.length; index$1++) {
-    watcher = queue[index$1];
-    id = watcher.id;
-    has[id] = null;
-    watcher.run();
-    // in dev build, check and stop circular updates.
-    if (process.env.NODE_ENV !== 'production' && has[id] != null) {
-      circular[id] = (circular[id] || 0) + 1;
-      if (circular[id] > MAX_UPDATE_COUNT) {
-        warn(
-          'You may have an infinite update loop ' + (
-            watcher.user
-              ? ("in watcher with expression \"" + (watcher.expression) + "\"")
-              : "in a component render function."
-          ),
-          watcher.vm
-        );
-        break
-      }
-    }
+  if (flushing) {
+    throw new Error('Cannot flush while already flushing.')
   }
 
-  // keep copies of post queues before resetting state
-  var activatedQueue = activatedChildren.slice();
-  var updatedQueue = queue.slice();
+  if (insideRun) {
+    throw new Error('Cannot flush while running a watcher.')
+  }
 
-  resetSchedulerState();
+  flushing = true;
+  var watcher, id;
+  var hookIndex;
 
-  // call component updated and activated hooks
-  callActivatedHooks(activatedQueue);
-  callUpdateHooks(updatedQueue);
+  // a watcher's run can throw
+  try {
+    // Sort queue before flush.
+    // This ensures that:
+    // 1. Components are updated from parent to child. (because parent is always
+    //    created before the child)
+    // 2. A component's user watchers are run before its render watcher (because
+    //    user watchers are created before the render watcher)
+    // 3. If a component is destroyed during a parent component's watcher run,
+    //    its watchers can be skipped.
+    queue.sort(function (a, b) { return a.id - b.id; });
 
-  // devtool hook
-  /* istanbul ignore if */
-  if (devtools && config.devtools) {
-    devtools.emit('flush');
+    index$1 = 0;
+    while (queue.length - index$1 || afterFlushCallbacks.length) {
+      // do not cache length because more watchers might be pushed
+      // as we run existing watchers
+      for (; index$1 < queue.length; index$1++) {
+        watcher = queue[index$1];
+        id = watcher.id;
+        has[id] = null;
+        watcher.run();
+        // in dev build, check and stop circular updates.
+        if (process.env.NODE_ENV !== 'production' && has[id] != null) {
+          circular[id] = (circular[id] || 0) + 1;
+          if (circular[id] > MAX_UPDATE_COUNT) {
+            warn(
+              'You may have an infinite update loop ' + (
+                watcher.user
+                  ? ("in watcher with expression \"" + (watcher.expression) + "\"")
+                  : "in a component render function."
+              ),
+              watcher.vm
+            );
+            // to remove the whole current queue
+            index$1 = queue.length;
+            break
+          }
+        }
+      }
+
+      if (afterFlushCallbacks.length) {
+        // call one afterFlush callback, which may queue more watchers
+        // TODO: Optimize to not modify array at every run.
+        var func = afterFlushCallbacks.shift();
+        try {
+          func();
+        } catch (e) {
+          handleError(e, null, "Error in an after flush callback.");
+        }
+      }
+    }
+  } finally {
+
+    // keep copies of post queues before resetting state
+    var activatedQueue = activatedChildren.slice();
+    // reset scheduler before updated hook called
+    hookIndex = index$1;
+    var updatedQueue = queue.slice(0, hookIndex);
+
+    resetSchedulerState();
+
+
+      // call component updated and activated hooks
+    callActivatedHooks(activatedQueue);
+    callUpdateHooks(updatedQueue);
+
+    // devtool hook
+    /* istanbul ignore if */
+    if (devtools && config.devtools) {
+      devtools.emit('flush');
+    }
+  }
+}
+
+/**
+ * Queue the flush.
+ */
+function requireFlush () {
+  if (!waiting) {
+    waiting = true;
+    nextTick(flushSchedulerQueue);
   }
 }
 
@@ -4992,10 +5043,34 @@ function queueWatcher (watcher) {
       }
       queue.splice(Math.max(i, index$1) + 1, 0, watcher);
     }
-    // queue the flush
-    if (!waiting) {
-      waiting = true;
-      nextTick(flushSchedulerQueue);
+    requireFlush();
+  }
+}
+
+/**
+ * Schedules a function to be called after the next flush, or later in the
+ * current flush if one is in progress, after all watchers have been rerun.
+ * The function will be run once and not on subsequent flushes unless
+ * `afterFlush` is called again.
+ */
+
+
+/**
+ * Forces a synchronous flush.
+ */
+
+
+/**
+ * Used in watchers to wrap provided getters to set scheduler flags.
+ */
+function wrapWatcherGetter (f) {
+  return function (/* args */) {
+    var previousInsideRun = insideRun;
+    insideRun = true;
+    try {
+      return f.apply(this, arguments)
+    } finally {
+      insideRun = previousInsideRun;
     }
   }
 }
@@ -5052,6 +5127,7 @@ var Watcher = function Watcher (
       );
     }
   }
+  this.getter = wrapWatcherGetter(this.getter);
   this.value = this.lazy
     ? undefined
     : this.get();
@@ -5062,25 +5138,28 @@ var Watcher = function Watcher (
  */
 Watcher.prototype.get = function get () {
   pushTarget(this);
-  var value;
-  var vm = this.vm;
-  if (this.user) {
-    try {
+  try {
+    var value;
+    var vm = this.vm;
+    if (this.user) {
+      try {
+        value = this.getter.call(vm, vm);
+      } catch (e) {
+        handleError(e, vm, ("getter for watcher \"" + (this.expression) + "\""));
+      }
+    } else {
       value = this.getter.call(vm, vm);
-    } catch (e) {
-      handleError(e, vm, ("getter for watcher \"" + (this.expression) + "\""));
     }
-  } else {
-    value = this.getter.call(vm, vm);
+    // "touch" every property so they are all tracked as
+    // dependencies for deep watching
+    if (this.deep) {
+      traverse(value);
+    }
+    this.cleanupDeps();
+    return value
+  } finally {
+    popTarget();
   }
-  // "touch" every property so they are all tracked as
-  // dependencies for deep watching
-  if (this.deep) {
-    traverse(value);
-  }
-  popTarget();
-  this.cleanupDeps();
-  return value
 };
 
 /**
